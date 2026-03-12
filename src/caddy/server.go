@@ -1,6 +1,7 @@
 package caddy
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -83,6 +84,28 @@ func (r *responseRecorder) Write(data []byte) (int, error) {
 	n, err := r.ResponseWriter.Write(data)
 	r.bytesOut += uint64(n)
 	return n, err
+}
+
+func (r *responseRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not support hijacking")
+	}
+	return hijacker.Hijack()
+}
+
+func (r *responseRecorder) Push(target string, opts *http.PushOptions) error {
+	pusher, ok := r.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return pusher.Push(target, opts)
 }
 
 func (r *deterministicReader) Read(p []byte) (int, error) {
@@ -390,12 +413,9 @@ func (s *Server) createReverseProxyHandler(service models.ServiceConfig, proxies
 		return nil, fmt.Errorf("代理地址不能为空")
 	}
 
-	targetURL, err := url.Parse(cfg.Upstream)
+	targetURL, err := normalizeReverseProxyUpstream(cfg.Upstream)
 	if err != nil {
 		return nil, err
-	}
-	if targetURL.Scheme == "" || targetURL.Host == "" {
-		return nil, fmt.Errorf("代理地址格式无效: %s", cfg.Upstream)
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
@@ -404,6 +424,27 @@ func (s *Server) createReverseProxyHandler(service models.ServiceConfig, proxies
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		proxy.ServeHTTP(w, r)
 	}), nil
+}
+
+func normalizeReverseProxyUpstream(raw string) (*url.URL, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, fmt.Errorf("代理地址不能为空")
+	}
+	targetURL, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	switch strings.ToLower(targetURL.Scheme) {
+	case "ws":
+		targetURL.Scheme = "http"
+	case "wss":
+		targetURL.Scheme = "https"
+	}
+	if targetURL.Scheme == "" || targetURL.Host == "" {
+		return nil, fmt.Errorf("代理地址格式无效: %s", raw)
+	}
+	return targetURL, nil
 }
 
 // createStaticHandler 创建静态文件处理器
