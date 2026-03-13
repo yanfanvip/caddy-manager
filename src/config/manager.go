@@ -44,6 +44,7 @@ func GetManager() *Manager {
 					LogFile:                        "caddy-panel.log",
 					LogRetentionDays:               7,
 					MaxAccessLogEntries:            10000,
+					MaxSecurityLogEntries:          5000,
 					CertificateConfigPath:          defaultCertificateConfigPath,
 					CertificateSyncIntervalSeconds: 3600,
 				},
@@ -56,6 +57,7 @@ func GetManager() *Manager {
 						ID:        "admin",
 						Username:  "admin",
 						Password:  security.HashPassword("admin"), // 默认密码 admin
+											Email:     "admin@admin.com",
 						Enabled:   true,
 						Role:      "admin",
 						CreatedAt: time.Now(),
@@ -119,6 +121,9 @@ func (m *Manager) normalizeGlobalLocked() {
 	}
 	if m.config.Global.MaxAccessLogEntries <= 0 {
 		m.config.Global.MaxAccessLogEntries = 10000
+	}
+	if m.config.Global.MaxSecurityLogEntries <= 0 {
+		m.config.Global.MaxSecurityLogEntries = 5000
 	}
 	if strings.TrimSpace(m.config.Global.CertificateConfigPath) == "" {
 		m.config.Global.CertificateConfigPath = defaultCertificateConfigPath

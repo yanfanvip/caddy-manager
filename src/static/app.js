@@ -109,27 +109,111 @@ function arrayBufferToBase64Url(buffer) {
     return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
+// Forge 库加载状态
+let forgeLibPromise = null;
+
+// Chart.js 库加载状态
+let chartLibPromise = null;
+let networkChartInstance = null;
+
+// 动态加载 Chart.js 库
+function loadChartLib() {
+    if (chartLibPromise) {
+        return chartLibPromise;
+    }
+    chartLibPromise = new Promise((resolve, reject) => {
+        if (window.Chart) {
+            resolve(window.Chart);
+            return;
+        }
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+        script.onload = () => {
+            if (window.Chart) {
+                resolve(window.Chart);
+            } else {
+                reject(new Error('Chart.js 加载失败'));
+            }
+        };
+        script.onerror = () => reject(new Error('加载 Chart.js 失败'));
+        document.head.appendChild(script);
+    });
+    return chartLibPromise;
+}
+
+// 动态加载 forge 库
+function loadForgeLib() {
+    if (forgeLibPromise) {
+        return forgeLibPromise;
+    }
+    forgeLibPromise = new Promise((resolve, reject) => {
+        if (window.forge) {
+            resolve(window.forge);
+            return;
+        }
+        const script = document.createElement('script');
+        script.src = '/static/vendor/forge.min.js';
+        script.onload = () => {
+            if (window.forge) {
+                resolve(window.forge);
+            } else {
+                reject(new Error('Forge 库加载失败'));
+            }
+        };
+        script.onerror = () => reject(new Error('加载加密库失败，请检查网络连接'));
+        document.head.appendChild(script);
+    });
+    return forgeLibPromise;
+}
+
+// 使用 forge 库进行 RSA-OAEP 加密
+async function encryptWithForge(value, publicKeyPem) {
+    const forge = await loadForgeLib();
+    const publicKey = forge.pki.publicKeyFromPem(publicKeyPem);
+    const encrypted = publicKey.encrypt(value, 'RSA-OAEP', {
+        md: forge.md.sha256.create(),
+        mgf1: { md: forge.md.sha256.create() }
+    });
+    // 转换为 Base64URL
+    const base64 = forge.util.encode64(encrypted);
+    return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+// 检测 Web Crypto API 是否可用
+function isWebCryptoAvailable() {
+    return !!(window.crypto && window.crypto.subtle);
+}
+
 async function encryptSecureValue(value) {
     if (!value) {
         return '';
     }
-    if (!window.crypto || !window.crypto.subtle) {
-        throw new Error('当前环境不支持密码加密，请使用现代浏览器或 HTTPS/localhost 访问');
-    }
     const publicKeyPem = await fetchAuthPublicKey();
-    const publicKey = await window.crypto.subtle.importKey(
-        'spki',
-        pemToArrayBuffer(publicKeyPem),
-        { name: 'RSA-OAEP', hash: 'SHA-256' },
-        false,
-        ['encrypt']
-    );
-    const encrypted = await window.crypto.subtle.encrypt(
-        { name: 'RSA-OAEP' },
-        publicKey,
-        new TextEncoder().encode(value)
-    );
-    return `enc::${arrayBufferToBase64Url(encrypted)}`;
+    
+    // 优先使用 Web Crypto API
+    if (isWebCryptoAvailable()) {
+        try {
+            const publicKey = await window.crypto.subtle.importKey(
+                'spki',
+                pemToArrayBuffer(publicKeyPem),
+                { name: 'RSA-OAEP', hash: 'SHA-256' },
+                false,
+                ['encrypt']
+            );
+            const encrypted = await window.crypto.subtle.encrypt(
+                { name: 'RSA-OAEP' },
+                publicKey,
+                new TextEncoder().encode(value)
+            );
+            return `enc::${arrayBufferToBase64Url(encrypted)}`;
+        } catch (e) {
+            console.warn('Web Crypto API 加密失败，尝试使用 forge 库:', e.message);
+        }
+    }
+    
+    // 回退到 forge 库
+    const encryptedBase64Url = await encryptWithForge(value, publicKeyPem);
+    return `enc::${encryptedBase64Url}`;
 }
 
 function generateRandomHexToken(length = 32) {
@@ -230,6 +314,9 @@ function showPage(page) {
         case 'settings':
             loadSettings();
             break;
+        case 'securityLogs':
+            loadSecurityLogs();
+            break;
     }
 }
 
@@ -240,6 +327,7 @@ function getPageTitle(page) {
         certificates: '证书管理',
         terminal: '终端管理',
         users: '用户管理',
+        securityLogs: '安全日志',
         settings: '设置'
     };
     return titles[page] || page;
@@ -543,71 +631,128 @@ function updateModalHeight() {
     modalBody.style.overflowY = naturalHeight > maxHeight ? 'auto' : 'visible';
 }
 
-function drawNetworkChart(points = []) {
+async function drawNetworkChart(points = []) {
     const canvas = document.getElementById('networkChart');
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const width = canvas.width;
-    const height = canvas.height;
-    const padding = { top: 24, right: 20, bottom: 34, left: 56 };
 
-    ctx.clearRect(0, 0, width, height);
-    ctx.fillStyle = '#f8fafc';
-    ctx.fillRect(0, 0, width, height);
-
-    const inValues = points.map(p => Number(p.in_rate || 0));
-    const outValues = points.map(p => Number(p.out_rate || 0));
-    const maxValue = Math.max(1, ...inValues, ...outValues);
-    const plotWidth = width - padding.left - padding.right;
-    const plotHeight = height - padding.top - padding.bottom;
-
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.25)';
-    ctx.lineWidth = 1;
-    ctx.font = '12px sans-serif';
-    ctx.fillStyle = '#64748b';
-
-    for (let i = 0; i <= 4; i++) {
-        const y = padding.top + (plotHeight / 4) * i;
-        ctx.beginPath();
-        ctx.moveTo(padding.left, y);
-        ctx.lineTo(width - padding.right, y);
-        ctx.stroke();
-
-        const value = formatBytes((maxValue / 4) * (4 - i));
-        ctx.fillText(value, 8, y + 4);
-    }
-
-    if (!points.length) {
+    try {
+        await loadChartLib();
+    } catch (e) {
+        // 回退到简单文字提示
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#f8fafc';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.fillStyle = '#94a3b8';
-        ctx.fillText('暂无网络历史数据，请等待采样积累。', padding.left, padding.top + plotHeight / 2);
+        ctx.font = '14px sans-serif';
+        ctx.fillText('图表组件加载失败', 20, canvas.height / 2);
         return;
     }
 
-    const drawLine = (values, color) => {
-        ctx.beginPath();
-        ctx.lineWidth = 2;
-        ctx.strokeStyle = color;
-        values.forEach((value, index) => {
-            const x = padding.left + (plotWidth * index) / Math.max(values.length - 1, 1);
-            const y = padding.top + plotHeight - (plotHeight * value) / maxValue;
-            if (index === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-        });
-        ctx.stroke();
-    };
+    // 销毁旧实例
+    if (networkChartInstance) {
+        networkChartInstance.destroy();
+        networkChartInstance = null;
+    }
 
-    drawLine(inValues, '#4f46e5');
-    drawLine(outValues, '#0ea5e9');
+    const labels = points.map(p => {
+        const date = new Date(p.timestamp);
+        return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+    });
+    const inValues = points.map(p => Number(p.in_rate || 0));
+    const outValues = points.map(p => Number(p.out_rate || 0));
 
-    ctx.fillStyle = '#64748b';
-    const labelIndexes = [0, Math.floor(points.length / 4), Math.floor(points.length / 2), Math.floor((points.length * 3) / 4), points.length - 1];
-    [...new Set(labelIndexes)].forEach(index => {
-        const point = points[index];
-        if (!point) return;
-        const x = padding.left + (plotWidth * index) / Math.max(points.length - 1, 1);
-        const date = new Date(point.timestamp);
-        const label = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
-        ctx.fillText(label, x - 16, height - 10);
+    if (!points.length) {
+        labels.push('');
+        inValues.push(0);
+        outValues.push(0);
+    }
+
+    networkChartInstance = new Chart(canvas, {
+        type: 'line',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: '入站',
+                    data: inValues,
+                    borderColor: '#4f46e5',
+                    backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    pointHoverBackgroundColor: '#4f46e5'
+                },
+                {
+                    label: '出站',
+                    data: outValues,
+                    borderColor: '#0ea5e9',
+                    backgroundColor: 'rgba(14, 165, 233, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    pointHoverRadius: 4,
+                    pointHoverBackgroundColor: '#0ea5e9'
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    display: false
+                },
+                tooltip: {
+                    backgroundColor: 'rgba(30, 41, 59, 0.9)',
+                    titleColor: '#fff',
+                    bodyColor: '#fff',
+                    padding: 12,
+                    cornerRadius: 8,
+                    displayColors: true,
+                    callbacks: {
+                        label: function(context) {
+                            return context.dataset.label + ': ' + formatRate(context.raw);
+                        }
+                    }
+                }
+            },
+            scales: {
+                x: {
+                    grid: {
+                        color: 'rgba(148, 163, 184, 0.15)',
+                        drawBorder: false
+                    },
+                    ticks: {
+                        color: '#64748b',
+                        font: { size: 11 },
+                        maxTicksLimit: 8,
+                        maxRotation: 0
+                    }
+                },
+                y: {
+                    beginAtZero: true,
+                    grid: {
+                        color: 'rgba(148, 163, 184, 0.15)',
+                        drawBorder: false
+                    },
+                    ticks: {
+                        color: '#64748b',
+                        font: { size: 11 },
+                        callback: function(value) {
+                            return formatBytes(value);
+                        }
+                    }
+                }
+            }
+        }
     });
 }
 
@@ -1016,11 +1161,11 @@ async function loadListenerServices(expectedListenerId = currentListenerId) {
                     <td class="service-sort-cell">
                         <button class="service-drag-handle ${isDefaultRule ? 'locked' : ''}" type="button" title="${isDefaultRule ? '默认规则固定在最下方，不参与拖拽排序' : '拖拽调整顺序'}">${isDefaultRule ? '🔒' : '⋮⋮'}</button>
                     </td>
-                    <td class="service-name-cell">${s.name || '未命名'}</td>
+                    <td><span class="service-name-cell" title="${escapeHtml(s.name || '未命名')}">${escapeHtml(s.name || '未命名')}</span></td>
                     <td><span class="service-status-badge ${enabled ? 'enabled' : 'disabled'}">${enabled ? '已开启' : '已关闭'}</span></td>
                     <td><span class="service-type-badge ${s.type}">${typeNames[s.type] || s.type}</span></td>
-                    <td class="listener-services-mobile-hidden"><span class="service-domain-cell">${s.domain || '*'}</span></td>
-                    <td class="service-target-cell listener-services-mobile-hidden">${target}</td>
+                    <td class="listener-services-mobile-hidden"><span class="service-domain-cell" title="${escapeHtml(s.domain || '*')}">${escapeHtml(s.domain || '*')}</span></td>
+                    <td class="listener-services-mobile-hidden"><span class="service-target-cell" title="${escapeHtml(target)}">${escapeHtml(target)}</span></td>
                     <td class="service-traffic-cell services-col-stat listener-services-mobile-hidden">
                         <div class="size">${formatBytes(stats.bytes_in_total || 0)}</div>
                         <div class="speed">${formatRate(stats.bytes_in_rate || 0)}</div>
@@ -1287,8 +1432,14 @@ function renderDefaultServiceConfig() {
     if (isAdvanced) {
         configHtml += `
             <div class="form-group">
-                ${labelWithHint('高级配置 (JSON格式)', '会与上面的基础配置合并保存，适合填写额外参数')}
-                <textarea id="defaultAdvanced" class="form-control" rows="6" placeholder='{"header_up": ["Host {host}"]}'>${defaultServiceDraft.advancedText || ''}</textarea>
+                <div class="advanced-config-header">
+                    <label>高级配置 (JSON格式)</label>
+                    <button type="button" class="btn btn-sm advanced-docs-toggle" onclick="showAdvancedDocsSidebar('${defaultServiceDraft.type}')">
+                        📖 查看配置说明
+                    </button>
+                </div>
+                <textarea id="defaultAdvanced" class="form-control" rows="6" placeholder='${getAdvancedConfigPlaceholder(defaultServiceDraft.type)}' onblur="validateJsonField(this)" oninput="clearJsonFieldError(this)">${defaultServiceDraft.advancedText || ''}</textarea>
+                <div id="defaultAdvancedError" class="json-field-error"></div>
             </div>
         `;
     }
@@ -1441,11 +1592,21 @@ async function saveListener(id = null) {
         };
 
         if (defaultServiceDraft.advancedText) {
+            const textarea = document.getElementById('defaultAdvanced');
+            if (textarea && !validateJsonField(textarea)) {
+                showToast('请修正默认响应高级配置中的 JSON 格式错误', 'error');
+                textarea.focus();
+                return;
+            }
             try {
                 const advanced = JSON.parse(defaultServiceDraft.advancedText);
+                if (typeof advanced !== 'object' || advanced === null || Array.isArray(advanced)) {
+                    showToast('默认响应高级配置必须是 JSON 对象格式', 'error');
+                    return;
+                }
                 defaultService.config = { ...defaultService.config, ...advanced };
             } catch (e) {
-                showToast('默认响应高级配置 JSON 格式错误', 'error');
+                showToast('默认响应高级配置 JSON 格式错误：' + e.message, 'error');
                 return;
             }
         }
@@ -3347,8 +3508,14 @@ function renderServiceConfigForm() {
     if (isAdvanced) {
         html += `
             <div class="form-group modal-span-2">
-                ${labelWithHint('高级配置 (JSON格式)', '支持补充额外配置参数，会与基础配置合并保存')}
-                <textarea id="configAdvanced" class="form-control" rows="6" placeholder='{"header_up": ["Host {host}"], "health_check": {"path": "/health"}}'>${currentServiceDraft.advancedText || ''}</textarea>
+                <div class="advanced-config-header">
+                    <label>高级配置 (JSON格式)</label>
+                    <button type="button" class="btn btn-sm advanced-docs-toggle" onclick="showAdvancedDocsSidebar('${currentServiceDraft.type}')">
+                        📖 查看配置说明
+                    </button>
+                </div>
+                <textarea id="configAdvanced" class="form-control" rows="8" placeholder='${getAdvancedConfigPlaceholder(currentServiceDraft.type)}' onblur="validateJsonField(this)" oninput="clearJsonFieldError(this)">${currentServiceDraft.advancedText || ''}</textarea>
+                <div id="configAdvancedError" class="json-field-error"></div>
             </div>
         `;
     }
@@ -3363,11 +3530,21 @@ async function saveService(id = null) {
 
     let config = { ...currentServiceDraft.config };
     if (currentServiceDraft.advancedText) {
+        const textarea = document.getElementById('configAdvanced');
+        if (textarea && !validateJsonField(textarea)) {
+            showToast('请修正高级配置中的 JSON 格式错误', 'error');
+            textarea.focus();
+            return;
+        }
         try {
             const advanced = JSON.parse(currentServiceDraft.advancedText);
+            if (typeof advanced !== 'object' || advanced === null || Array.isArray(advanced)) {
+                showToast('高级配置必须是 JSON 对象格式', 'error');
+                return;
+            }
             config = { ...config, ...advanced };
         } catch (e) {
-            showToast('高级配置 JSON 格式错误', 'error');
+            showToast('高级配置 JSON 格式错误：' + e.message, 'error');
             return;
         }
     }
@@ -3472,3 +3649,377 @@ setInterval(() => {
         loadDashboard();
     }
 }, 5000);
+
+// 显示高级配置说明侧边栏
+function showAdvancedDocsSidebar(type) {
+    const docsHtml = getAdvancedConfigDocs(type);
+    const typeNames = {
+        'reverse_proxy': '反向代理',
+        'static': '静态文件服务',
+        'redirect': '重定向',
+        'url_jump': 'URL跳转',
+        'text_output': '文本输出'
+    };
+    const sidebar = document.getElementById('advancedDocsSidebar');
+    const title = document.getElementById('advancedDocsSidebarTitle');
+    const content = document.getElementById('advancedDocsSidebarContent');
+    
+    if (sidebar && title && content) {
+        title.textContent = `${typeNames[type] || type} 高级配置说明`;
+        content.innerHTML = docsHtml;
+        sidebar.classList.add('active');
+        document.body.style.overflow = 'hidden';
+    }
+}
+
+// 关闭高级配置说明侧边栏
+function closeAdvancedDocsSidebar() {
+    const sidebar = document.getElementById('advancedDocsSidebar');
+    if (sidebar) {
+        sidebar.classList.remove('active');
+        document.body.style.overflow = '';
+    }
+}
+
+// 校验 JSON 字段
+function validateJsonField(textarea) {
+    const value = textarea.value.trim();
+    const errorEl = document.getElementById(textarea.id + 'Error');
+    
+    if (!value) {
+        // 空值是有效的
+        textarea.classList.remove('json-invalid');
+        if (errorEl) errorEl.textContent = '';
+        return true;
+    }
+    
+    try {
+        const parsed = JSON.parse(value);
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            throw new Error('必须是 JSON 对象');
+        }
+        textarea.classList.remove('json-invalid');
+        if (errorEl) errorEl.textContent = '';
+        return true;
+    } catch (e) {
+        textarea.classList.add('json-invalid');
+        if (errorEl) {
+            let msg = 'JSON 格式错误';
+            if (e.message.includes('position')) {
+                const match = e.message.match(/position (\d+)/);
+                if (match) {
+                    msg += `（位置 ${match[1]}）`;
+                }
+            } else if (e.message === '必须是 JSON 对象') {
+                msg = '必须是 JSON 对象格式，如 {"key": "value"}';
+            }
+            errorEl.textContent = msg;
+        }
+        return false;
+    }
+}
+
+// 清除 JSON 字段错误状态
+function clearJsonFieldError(textarea) {
+    textarea.classList.remove('json-invalid');
+    const errorEl = document.getElementById(textarea.id + 'Error');
+    if (errorEl) errorEl.textContent = '';
+}
+
+// 获取高级配置说明文档
+function getAdvancedConfigDocs(type) {
+    if (type === 'reverse_proxy') {
+        return `
+<div class="docs-section">
+    <h4>🔧 Host 头配置</h4>
+    <div class="docs-item">
+        <code>"preserve_host": true</code>
+        <p>保留客户端请求的原始 Host 头发送给上游服务器</p>
+    </div>
+    <div class="docs-item">
+        <code>"host_header": "backend.example.com"</code>
+        <p>自定义发送给上游的 Host 头（优先级低于 preserve_host）</p>
+    </div>
+</div>
+<div class="docs-section">
+    <h4>🛤️ 路径处理</h4>
+    <div class="docs-item">
+        <code>"strip_path_prefix": "/api"</code>
+        <p>去除请求路径前缀。如 /api/users → /users</p>
+    </div>
+    <div class="docs-item">
+        <code>"add_path_prefix": "/v1"</code>
+        <p>添加请求路径前缀。如 /users → /v1/users</p>
+    </div>
+</div>
+<div class="docs-section">
+    <h4>📤 请求头配置 (发送给上游)</h4>
+    <div class="docs-item">
+        <code>"header_up": {"X-Custom": "value", "Authorization": "Bearer token"}</code>
+        <p>添加或修改发送给上游的请求头。支持变量：{host}=原始Host、{remote}=客户端IP、{scheme}=协议</p>
+    </div>
+    <div class="docs-item">
+        <code>"hide_header_up": ["Cookie", "Authorization"]</code>
+        <p>隐藏指定的请求头，不发送给上游</p>
+    </div>
+</div>
+<div class="docs-section">
+    <h4>📥 响应头配置 (返回给客户端)</h4>
+    <div class="docs-item">
+        <code>"header_down": {"X-Frame-Options": "DENY", "Cache-Control": "no-cache"}</code>
+        <p>添加或修改返回给客户端的响应头</p>
+    </div>
+    <div class="docs-item">
+        <code>"hide_header_down": ["Server", "X-Powered-By"]</code>
+        <p>隐藏指定的响应头，不返回给客户端</p>
+    </div>
+</div>
+<div class="docs-section">
+    <h4>⚙️ 其他配置</h4>
+    <div class="docs-item">
+        <code>"trust_proxy_headers": true</code>
+        <p>信任上游代理头（X-Forwarded-*），不覆盖已有的转发信息</p>
+    </div>
+    <div class="docs-item">
+        <code>"timeout": 60</code>
+        <p>请求超时时间（秒），默认 30 秒</p>
+    </div>
+</div>
+<div class="docs-section docs-example">
+    <h4>📋 完整示例</h4>
+    <pre>{
+  "preserve_host": true,
+  "strip_path_prefix": "/api",
+  "header_up": {
+    "X-Real-Host": "{host}",
+    "X-Request-ID": "req-12345"
+  },
+  "header_down": {
+    "X-Frame-Options": "SAMEORIGIN",
+    "Strict-Transport-Security": "max-age=31536000"
+  },
+  "hide_header_down": ["Server", "X-Powered-By"]
+}</pre>
+</div>`;
+    }
+    
+    if (type === 'static') {
+        return `
+<div class="docs-section">
+    <h4>📁 静态文件服务配置</h4>
+    <div class="docs-item">
+        <code>"root": "/var/www/html"</code>
+        <p>静态文件根目录路径</p>
+    </div>
+    <div class="docs-item">
+        <code>"index": "index.html"</code>
+        <p>默认首页文件名</p>
+    </div>
+    <div class="docs-item">
+        <code>"browse": true</code>
+        <p>启用目录浏览功能</p>
+    </div>
+</div>`;
+    }
+    
+    if (type === 'redirect' || type === 'url_jump') {
+        return `
+<div class="docs-section">
+    <h4>🔀 重定向/跳转配置</h4>
+    <div class="docs-item">
+        <code>"to": "https://example.com{uri}"</code>
+        <p>重定向目标地址，支持 {uri} 变量保留原始路径</p>
+    </div>
+    <div class="docs-item">
+        <code>"preserve_path": true</code>
+        <p>跳转时保留原始请求路径</p>
+    </div>
+</div>`;
+    }
+    
+    if (type === 'text_output') {
+        return `
+<div class="docs-section">
+    <h4>📝 文本输出配置</h4>
+    <div class="docs-item">
+        <code>"body": "Hello World"</code>
+        <p>返回的文本内容</p>
+    </div>
+    <div class="docs-item">
+        <code>"content_type": "application/json"</code>
+        <p>响应的 Content-Type</p>
+    </div>
+    <div class="docs-item">
+        <code>"status_code": 200</code>
+        <p>HTTP 响应状态码</p>
+    </div>
+</div>`;
+    }
+    
+    return '<p class="docs-empty">暂无该类型的高级配置说明</p>';
+}
+
+// 获取高级配置占位符
+function getAdvancedConfigPlaceholder(type) {
+    if (type === 'reverse_proxy') {
+        return `{
+  "preserve_host": true,
+  "header_up": {"X-Custom": "value"},
+  "header_down": {"X-Frame-Options": "DENY"}
+}`;
+    }
+    return '{}';
+}
+
+// ======================== 安全日志 ========================
+
+let securityLogsCurrentPage = 1;
+const securityLogsPageSize = 20;
+
+async function loadSecurityLogs(page = 1) {
+    securityLogsCurrentPage = page;
+    const typeFilter = document.getElementById('securityLogTypeFilter').value;
+    const levelFilter = document.getElementById('securityLogLevelFilter').value;
+    
+    const params = new URLSearchParams({
+        page: page,
+        page_size: securityLogsPageSize
+    });
+    if (typeFilter) params.append('type', typeFilter);
+    if (levelFilter) params.append('level', levelFilter);
+    
+    try {
+        const [logsData, statsData] = await Promise.all([
+            apiRequest(`/security-logs?${params}`),
+            apiRequest('/security-logs/stats')
+        ]);
+        
+        if (logsData.success) {
+            renderSecurityLogs(logsData.data.logs || []);
+            renderSecurityLogsPagination(logsData.data.total || 0, page);
+        } else {
+            showNotification(logsData.error || '加载安全日志失败', 'error');
+        }
+        
+        if (statsData.success) {
+            renderSecurityLogsStats(statsData.data);
+        }
+    } catch (e) {
+        showNotification('加载安全日志失败: ' + e.message, 'error');
+    }
+}
+
+function renderSecurityLogs(logs) {
+    const tbody = document.getElementById('securityLogsList');
+    if (!logs || logs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; color: #666;">暂无安全日志记录</td></tr>';
+        return;
+    }
+    
+    const typeLabels = {
+        'oauth_login': 'OAuth登录',
+        'proxy_error': '代理错误',
+        'ssh_connect': 'SSH连接',
+        'system_operate': '系统操作'
+    };
+    
+    const levelLabels = {
+        'info': { text: '信息', class: 'status-active' },
+        'warning': { text: '警告', class: 'status-warning' },
+        'error': { text: '错误', class: 'status-error' }
+    };
+    
+    tbody.innerHTML = logs.map(log => {
+        const time = new Date(log.timestamp).toLocaleString('zh-CN');
+        const typeLabel = typeLabels[log.type] || log.type;
+        const level = levelLabels[log.level] || { text: log.level, class: '' };
+        const statusClass = log.success ? 'status-active' : 'status-error';
+        const statusText = log.success ? '成功' : '失败';
+        
+        return `<tr>
+            <td style="white-space: nowrap;">${time}</td>
+            <td><span class="badge">${typeLabel}</span></td>
+            <td><span class="${level.class}">${level.text}</span></td>
+            <td>${log.username || '-'}</td>
+            <td>${log.remote_addr || '-'}</td>
+            <td>${log.action || '-'}</td>
+            <td style="max-width: 300px; overflow: hidden; text-overflow: ellipsis;" title="${escapeHtml(log.message)}">${escapeHtml(log.message || '-')}</td>
+            <td><span class="${statusClass}">${statusText}</span></td>
+        </tr>`;
+    }).join('');
+}
+
+function renderSecurityLogsStats(stats) {
+    const container = document.getElementById('securityLogsStats');
+    if (!stats) {
+        container.innerHTML = '';
+        return;
+    }
+    
+    const items = [
+        { label: '总记录', value: stats.total || 0 },
+        { label: 'OAuth登录', value: stats.by_type?.oauth_login || 0 },
+        { label: '代理错误', value: stats.by_type?.proxy_error || 0 },
+        { label: 'SSH连接', value: stats.by_type?.ssh_connect || 0 },
+        { label: '系统操作', value: stats.by_type?.system_operate || 0 }
+    ];
+    
+    container.innerHTML = items.map(item => 
+        `<span style="background: #f1f5f9; padding: 4px 12px; border-radius: 6px; font-size: 13px;">${item.label}: <strong>${item.value}</strong></span>`
+    ).join('');
+}
+
+function renderSecurityLogsPagination(total, currentPage) {
+    const container = document.getElementById('securityLogsPagination');
+    const totalPages = Math.ceil(total / securityLogsPageSize);
+    
+    if (totalPages <= 1) {
+        container.innerHTML = '';
+        return;
+    }
+    
+    let html = '';
+    if (currentPage > 1) {
+        html += `<button class="btn" onclick="loadSecurityLogs(${currentPage - 1})">上一页</button>`;
+    }
+    
+    const start = Math.max(1, currentPage - 2);
+    const end = Math.min(totalPages, currentPage + 2);
+    
+    for (let i = start; i <= end; i++) {
+        if (i === currentPage) {
+            html += `<button class="btn btn-primary">${i}</button>`;
+        } else {
+            html += `<button class="btn" onclick="loadSecurityLogs(${i})">${i}</button>`;
+        }
+    }
+    
+    if (currentPage < totalPages) {
+        html += `<button class="btn" onclick="loadSecurityLogs(${currentPage + 1})">下一页</button>`;
+    }
+    
+    container.innerHTML = html;
+}
+
+async function clearSecurityLogs() {
+    showConfirm('确定要清空所有安全日志吗？此操作不可恢复。', async () => {
+        try {
+            const data = await apiRequest('/security-logs', { method: 'DELETE' });
+            if (data.success) {
+                showNotification('安全日志已清空', 'success');
+                loadSecurityLogs();
+            } else {
+                showNotification(data.error || '清空失败', 'error');
+            }
+        } catch (e) {
+            showNotification('清空失败: ' + e.message, 'error');
+        }
+    });
+}
+
+function escapeHtml(text) {
+    if (!text) return '';
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}

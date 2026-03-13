@@ -564,19 +564,21 @@ func (m *CertificateManager) DeleteCertificate(id string) error {
 	if cert == nil {
 		return errors.New("证书不存在")
 	}
-	if cert.Source == models.CertificateSourceFileSync {
-		return errors.New("配置文件同步证书不能单独删除，请修改外部配置文件")
-	}
+	// 外部配置文件同步的证书，允许直接删除内部数据（不同步到外部配置文件）
+	isFileSync := cert.Source == models.CertificateSourceFileSync
 	for _, service := range config.GetManager().GetServices() {
 		if service.CertificateID == id {
 			return fmt.Errorf("证书已绑定到服务 [%s]，请先解除绑定", service.Name)
 		}
 	}
 
-	_ = os.Remove(resolveCertificatePath(cert.CertPath))
-	_ = os.Remove(resolveCertificatePath(cert.KeyPath))
-	if cert.AccountKeyPath != "" {
-		_ = os.Remove(resolveCertificatePath(cert.AccountKeyPath))
+	// 只有非外部同步证书才删除物理文件
+	if !isFileSync {
+		_ = os.Remove(resolveCertificatePath(cert.CertPath))
+		_ = os.Remove(resolveCertificatePath(cert.KeyPath))
+		if cert.AccountKeyPath != "" {
+			_ = os.Remove(resolveCertificatePath(cert.AccountKeyPath))
+		}
 	}
 
 	if err := config.GetManager().DeleteCertificate(id); err != nil {
@@ -1061,6 +1063,7 @@ func (m *CertificateManager) matchCertificateByDomainLocked(host string) *tls.Ce
 		if loaded.tlsCert == nil {
 			continue
 		}
+		// 首先检查证书配置中的域名
 		for _, domain := range loaded.config.Domains {
 			domain = normalizeDomain(domain)
 			if domain == "" {
@@ -1071,6 +1074,22 @@ func (m *CertificateManager) matchCertificateByDomainLocked(host string) *tls.Ce
 			}
 			if wildcardMatch == nil && matchCertificateDomain(domain, host) {
 				wildcardMatch = loaded.tlsCert
+			}
+		}
+		// 然后检查证书实际包含的域名（用于通配符证书匹配）
+		if loaded.leaf != nil {
+			certDomains := sanitizeDomains(append([]string{loaded.leaf.Subject.CommonName}, loaded.leaf.DNSNames...))
+			for _, domain := range certDomains {
+				domain = normalizeDomain(domain)
+				if domain == "" {
+					continue
+				}
+				if domain == host {
+					return loaded.tlsCert
+				}
+				if wildcardMatch == nil && matchCertificateDomain(domain, host) {
+					wildcardMatch = loaded.tlsCert
+				}
 			}
 		}
 	}

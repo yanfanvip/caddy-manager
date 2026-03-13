@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"caddy-panel/config"
 	"caddy-panel/handlers"
 	"caddy-panel/utils"
 )
@@ -15,17 +14,8 @@ import (
 // AuthMiddleware 认证中间件
 func AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 检查全局认证设置
-		cfg := config.GetManager().GetConfig()
-
 		// 公开路径不需要认证
 		if isPublicPath(r.URL.Path) {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// 如果未启用全局认证，允许访问
-		if !cfg.Global.DefaultAuth {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -66,9 +56,20 @@ func AuthMiddleware(next http.Handler) http.Handler {
 
 // isPublicPath 检查是否为公开路径
 func isPublicPath(path string) bool {
-	// 默认所有路径都公开，不需要登录
-	// 认证只在服务配置中可选择开启
-	return true
+	// 登录相关接口始终公开
+	publicPaths := []string{
+		"/api/login",
+		"/api/auth/public-key",
+		"/api/logout",
+	}
+	for _, p := range publicPaths {
+		if path == p {
+			return true
+		}
+	}
+	// 其他路径根据全局认证设置决定是否公开
+	// 当 DefaultAuth=true 时，非公开路径需要认证
+	return false
 }
 
 // AdminMiddleware 管理员权限中间件

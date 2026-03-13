@@ -1,12 +1,20 @@
 package handlers
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"caddy-panel/caddy"
 	"caddy-panel/config"
+	"caddy-panel/pkg/oauth"
 	"caddy-panel/security"
 	"caddy-panel/utils"
 )
@@ -104,4 +112,154 @@ func GetCurrentUserHandler(w http.ResponseWriter, r *http.Request) {
 // ValidateToken 验证JWT token
 func ValidateToken(tokenString string) (*utils.Claims, error) {
 	return utils.ValidateToken(tokenString)
+}
+
+// adminOAuthLoginPayload OAuth登录请求负载
+type adminOAuthLoginPayload struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Remember bool   `json:"remember"`
+}
+
+// AdminOAuthHandler 管理后台OAuth登录处理
+func AdminOAuthHandler(w http.ResponseWriter, r *http.Request) {
+	remoteAddr := r.RemoteAddr
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		remoteAddr = strings.Split(xff, ",")[0]
+	}
+
+	// 检查是否已登录
+	if claims, _ := utils.GetAuthClaimsFromRequest(r); claims != nil {
+		redirect := r.URL.Query().Get("redirect")
+		if redirect == "" {
+			redirect = "/"
+		}
+		http.Redirect(w, r, redirect, http.StatusFound)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		renderAdminOAuthLoginPage(w, r, "")
+		return
+	}
+
+	// POST 处理登录
+	if err := r.ParseForm(); err != nil {
+		security.GetAuditLogger().LogOAuthLogin("", remoteAddr, false, "表单解析失败")
+		renderAdminOAuthLoginPage(w, r, "表单解析失败")
+		return
+	}
+
+	payload, err := parseAdminOAuthLoginPayload(r)
+	if err != nil {
+		security.GetAuditLogger().LogOAuthLogin("", remoteAddr, false, err.Error())
+		renderAdminOAuthLoginPage(w, r, err.Error())
+		return
+	}
+
+	username := strings.TrimSpace(payload.Username)
+	password := payload.Password
+	redirectTarget := r.FormValue("redirect")
+	if redirectTarget == "" {
+		redirectTarget = "/"
+	}
+
+	user := config.GetManager().GetUserByUsername(username)
+	if user == nil {
+		security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, false, "用户不存在")
+		renderAdminOAuthLoginPage(w, r, "用户名或密码错误")
+		return
+	}
+	if !user.Enabled {
+		security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, false, "用户已被禁用")
+		renderAdminOAuthLoginPage(w, r, "用户已被禁用")
+		return
+	}
+	if !security.ComparePassword(user.Password, password) {
+		security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, false, "密码错误")
+		renderAdminOAuthLoginPage(w, r, "用户名或密码错误")
+		return
+	}
+
+	tokenTTL := 24 * time.Hour
+	if payload.Remember {
+		tokenTTL = 30 * 24 * time.Hour
+	}
+	token, err := utils.GenerateToken(user.Username, user.Role, tokenTTL)
+	if err != nil {
+		security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, false, "生成令牌失败")
+		renderAdminOAuthLoginPage(w, r, "生成登录令牌失败")
+		return
+	}
+
+	security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, true, "管理后台登录成功")
+	utils.SetAuthCookie(w, token, r.TLS != nil, tokenTTL)
+	http.Redirect(w, r, redirectTarget, http.StatusFound)
+}
+
+func parseAdminOAuthLoginPayload(r *http.Request) (*adminOAuthLoginPayload, error) {
+	encryptedPayload := strings.TrimSpace(r.FormValue("payload"))
+	if encryptedPayload != "" {
+		return decryptAdminOAuthPayload(encryptedPayload)
+	}
+	return &adminOAuthLoginPayload{
+		Username: r.FormValue("username"),
+		Password: r.FormValue("password"),
+		Remember: r.FormValue("remember") == "on" || r.FormValue("remember") == "true",
+	}, nil
+}
+
+func decryptAdminOAuthPayload(encryptedPayload string) (*adminOAuthLoginPayload, error) {
+	privateKey := caddy.GetServer().GetOAuthPrivateKey()
+	if privateKey == nil {
+		return nil, fmt.Errorf("服务端未配置加密密钥")
+	}
+
+	encryptedPayload = strings.ReplaceAll(encryptedPayload, "-", "+")
+	encryptedPayload = strings.ReplaceAll(encryptedPayload, "_", "/")
+	switch len(encryptedPayload) % 4 {
+	case 2:
+		encryptedPayload += "=="
+	case 3:
+		encryptedPayload += "="
+	}
+
+	encryptedBytes, err := base64.StdEncoding.DecodeString(encryptedPayload)
+	if err != nil {
+		return nil, fmt.Errorf("解码失败: %w", err)
+	}
+
+	decrypted, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, privateKey, encryptedBytes, nil)
+	if err != nil {
+		return nil, fmt.Errorf("解密失败: %w", err)
+	}
+
+	var payload adminOAuthLoginPayload
+	if err := json.Unmarshal(decrypted, &payload); err != nil {
+		return nil, fmt.Errorf("解析失败: %w", err)
+	}
+	return &payload, nil
+}
+
+func renderAdminOAuthLoginPage(w http.ResponseWriter, r *http.Request, errMsg string) {
+	redirectTarget := r.URL.Query().Get("redirect")
+	if redirectTarget == "" {
+		redirectTarget = r.FormValue("redirect")
+	}
+	publicKeyPEM := caddy.GetServer().GetOAuthPublicKeyPEM()
+	oauth.RenderLoginPage(w, redirectTarget, errMsg, publicKeyPEM)
+}
+
+// AdminPageAuthMiddleware 管理后台页面认证中间件
+func AdminPageAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 检查是否已登录
+		if claims, _ := utils.GetAuthClaimsFromRequest(r); claims != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// 未登录，重定向到登录页面
+		redirectURL := fmt.Sprintf("/admin-oauth?redirect=%s", url.QueryEscape(r.URL.RequestURI()))
+		http.Redirect(w, r, redirectURL, http.StatusFound)
+	})
 }

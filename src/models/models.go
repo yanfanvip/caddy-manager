@@ -115,6 +115,18 @@ type ReverseProxyConfig struct {
 	OAuth       bool   `json:"oauth"`        // 是否开启OAuth认证
 	AccessLog   bool   `json:"access_log"`   // 记录访问日志
 	HealthCheck bool   `json:"health_check"` // 健康检查
+
+	// 高级配置
+	PreserveHost    bool              `json:"preserve_host"`     // 保留原始Host头发送给上游
+	HostHeader      string            `json:"host_header"`       // 自定义发送给上游的Host头
+	StripPathPrefix string            `json:"strip_path_prefix"` // 去除请求路径前缀
+	AddPathPrefix   string            `json:"add_path_prefix"`   // 添加请求路径前缀
+	HeaderUp        map[string]string `json:"header_up"`         // 添加/修改发送给上游的请求头
+	HeaderDown      map[string]string `json:"header_down"`       // 添加/修改发送给客户端的响应头
+	HideHeaderUp    []string          `json:"hide_header_up"`    // 隐藏发送给上游的请求头
+	HideHeaderDown  []string          `json:"hide_header_down"`  // 隐藏发送给客户端的响应头
+	BufferRequests  bool              `json:"buffer_requests"`   // 缓冲请求体（用于重试）
+	TrustProxyHeaders bool            `json:"trust_proxy_headers"` // 信任上游代理头（X-Forwarded-*）
 }
 
 // StaticConfig 静态文件配置
@@ -292,8 +304,43 @@ type GlobalConfig struct {
 	LogFile                        string `json:"log_file"`                          // 日志文件路径
 	LogRetentionDays               int    `json:"log_retention_days"`                // 日志保留天数
 	MaxAccessLogEntries            int    `json:"max_access_log_entries"`            // 最大访问日志条数
+	MaxSecurityLogEntries          int    `json:"max_security_log_entries"`          // 最大安全日志条数
 	CertificateConfigPath          string `json:"certificate_config_path"`           // 外部证书配置文件路径
 	CertificateSyncIntervalSeconds int    `json:"certificate_sync_interval_seconds"` // 外部证书同步周期
+}
+
+// SecurityLogType 安全日志类型
+type SecurityLogType string
+
+const (
+	SecurityLogTypeOAuthLogin    SecurityLogType = "oauth_login"    // OAuth登录
+	SecurityLogTypeProxyError    SecurityLogType = "proxy_error"    // 代理报错
+	SecurityLogTypeSSHConnect    SecurityLogType = "ssh_connect"    // SSH终端连接
+	SecurityLogTypeSystemOperate SecurityLogType = "system_operate" // 系统操作
+)
+
+// SecurityLogLevel 安全日志级别
+type SecurityLogLevel string
+
+const (
+	SecurityLogLevelInfo    SecurityLogLevel = "info"
+	SecurityLogLevelWarning SecurityLogLevel = "warning"
+	SecurityLogLevelError   SecurityLogLevel = "error"
+)
+
+// SecurityLogEntry 安全日志条目
+type SecurityLogEntry struct {
+	ID         string           `json:"id"`
+	Timestamp  time.Time        `json:"timestamp"`
+	Type       SecurityLogType  `json:"type"`
+	Level      SecurityLogLevel `json:"level"`
+	Username   string           `json:"username,omitempty"` // 操作用户
+	RemoteAddr string           `json:"remote_addr"`        // 来源IP
+	Target     string           `json:"target,omitempty"`   // 目标（如服务名、SSH连接名）
+	Action     string           `json:"action"`             // 动作描述
+	Message    string           `json:"message"`            // 详细信息
+	Success    bool             `json:"success"`            // 是否成功
+	Extra      map[string]any   `json:"extra,omitempty"`    // 额外信息
 }
 
 // AppConfig 应用配置

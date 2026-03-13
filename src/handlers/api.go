@@ -387,15 +387,21 @@ func UpdateServiceHandler(w http.ResponseWriter, r *http.Request) {
 	service.ID = id
 	service.UpdatedAt = time.Now()
 
+	// 获取当前监听器状态，如果监听器是disabled状态，则不启动它
+	listener := config.GetManager().GetListener(service.PortID)
+	wasListenerDisabled := listener != nil && !listener.Enabled
+
 	if err := config.GetManager().UpdateService(service); err != nil {
 		WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// 重新加载服务
-	if err := caddy.GetServer().ReloadService(service); err != nil {
-		WriteError(w, http.StatusInternalServerError, err.Error())
-		return
+	// 只有监听器是启用状态时才重新加载服务
+	if !wasListenerDisabled {
+		if err := caddy.GetServer().ReloadService(service); err != nil {
+			WriteError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	WriteSuccess(w, service)

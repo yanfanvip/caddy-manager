@@ -21,15 +21,17 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"caddy-panel/config"
 	"caddy-panel/models"
+	"caddy-panel/pkg/oauth"
 	"caddy-panel/security"
 	"caddy-panel/utils"
+
+	"github.com/gorilla/websocket"
 )
 
 // Server Caddy服务器管理
@@ -38,6 +40,8 @@ type Server struct {
 	ctx               context.Context
 	cancel            context.CancelFunc
 	servers           map[string]*http.Server
+	routes            map[string][]serviceRoute // 动态路由表，按监听器ID分组
+	listeners         map[string]models.PortListener // 监听器配置缓存
 	proxies           map[string]*httputil.ReverseProxy
 	lastGood          map[string]listenerSnapshot
 	oauthPrivateKey   *rsa.PrivateKey
@@ -134,6 +138,28 @@ var once sync.Once
 
 const defaultSecureSecret = security.DefaultSecureSecret
 
+// 全局共享的 HTTP Transport，启用连接复用
+var sharedTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialContext: (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	ForceAttemptHTTP2:     false,             // 不强制 HTTP/2，让协议自动协商
+	MaxIdleConns:          200,               // 最大空闲连接数
+	MaxIdleConnsPerHost:   50,                // 每个主机最大空闲连接数
+	MaxConnsPerHost:       100,               // 每个主机最大连接数
+	IdleConnTimeout:       90 * time.Second,  // 空闲连接超时
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: 1 * time.Second,
+	ResponseHeaderTimeout: 60 * time.Second,
+	DisableCompression:    true,              // 禁用自动压缩处理，让客户端与后端直接协商
+	DisableKeepAlives:     false,             // 保持连接复用
+	TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: true,             // 跳过后端 HTTPS 证书验证
+	},
+}
+
 // GetServer 获取Caddy服务器单例
 func GetServer() *Server {
 	once.Do(func() {
@@ -143,6 +169,8 @@ func GetServer() *Server {
 			ctx:               ctx,
 			cancel:            cancel,
 			servers:           make(map[string]*http.Server),
+			routes:            make(map[string][]serviceRoute),
+			listeners:         make(map[string]models.PortListener),
 			proxies:           make(map[string]*httputil.ReverseProxy),
 			lastGood:          make(map[string]listenerSnapshot),
 			oauthPrivateKey:   privateKey,
@@ -182,6 +210,8 @@ func (s *Server) Stop() error {
 	}
 
 	s.servers = make(map[string]*http.Server)
+	s.routes = make(map[string][]serviceRoute)
+	s.listeners = make(map[string]models.PortListener)
 	s.proxies = make(map[string]*httputil.ReverseProxy)
 	s.lastGood = make(map[string]listenerSnapshot)
 	return nil
@@ -217,6 +247,8 @@ func (s *Server) StopListener(listenerID string) error {
 		s.cleanupListenerProxiesLocked(snapshot.services)
 		delete(s.lastGood, listenerID)
 	}
+	delete(s.routes, listenerID)
+	delete(s.listeners, listenerID)
 	return nil
 }
 
@@ -258,15 +290,27 @@ func (s *Server) buildListenerRoutes(listener models.PortListener, services []mo
 	return routes, proxies, nil
 }
 
-func (s *Server) buildHTTPServer(listener models.PortListener, routes []serviceRoute) *http.Server {
+func (s *Server) buildHTTPServer(listener models.PortListener) *http.Server {
 	addr := fmt.Sprintf(":%d", listener.Port)
+	listenerID := listener.ID
 	return &http.Server{
 		Addr: addr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if utils.GetCertificateManager().ServeHTTPChallenge(w, r) {
 				return
 			}
-			if s.handleOAuthRequest(listener, w, r) {
+			// 动态获取监听器配置（用于 OAuth）
+			s.mu.RLock()
+			currentListener, hasListener := s.listeners[listenerID]
+			routes := s.routes[listenerID]
+			s.mu.RUnlock()
+
+			if !hasListener {
+				http.NotFound(w, r)
+				return
+			}
+
+			if s.handleOAuthRequest(currentListener, w, r) {
 				return
 			}
 			host := normalizeHost(r.Host)
@@ -307,12 +351,14 @@ func (s *Server) restoreSnapshotLocked(snapshot listenerSnapshot) error {
 	if err != nil {
 		return err
 	}
-	server := s.buildHTTPServer(snapshot.listener, routes)
+	server := s.buildHTTPServer(snapshot.listener)
 	netListener, err := s.createNetListener(snapshot.listener)
 	if err != nil {
 		return err
 	}
 	s.servers[snapshot.listener.ID] = server
+	s.routes[snapshot.listener.ID] = routes
+	s.listeners[snapshot.listener.ID] = snapshot.listener
 	s.cleanupListenerProxiesLocked(snapshot.services)
 	for id, proxy := range proxies {
 		s.proxies[id] = proxy
@@ -326,22 +372,33 @@ func (s *Server) applyListenerConfig(listener models.PortListener, services []mo
 	if err != nil {
 		return err
 	}
-	server := s.buildHTTPServer(listener, routes)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	previousSnapshot, hasPrevious := s.lastGood[listener.ID]
-	if existing, exists := s.servers[listener.ID]; exists {
-		if err := existing.Shutdown(context.Background()); err != nil {
-			return err
+
+	// 如果监听器已经在运行，只更新路由表，不重启服务器
+	if _, exists := s.servers[listener.ID]; exists {
+		// 清理旧的代理
+		if hasPrevious {
+			s.cleanupListenerProxiesLocked(previousSnapshot.services)
 		}
-		delete(s.servers, listener.ID)
-	}
-	if hasPrevious {
-		s.cleanupListenerProxiesLocked(previousSnapshot.services)
+		// 更新路由表和代理（热更新，无需重启）
+		s.routes[listener.ID] = routes
+		s.listeners[listener.ID] = listener
+		for id, proxy := range proxies {
+			s.proxies[id] = proxy
+		}
+		s.lastGood[listener.ID] = listenerSnapshot{
+			listener: listener,
+			services: cloneServices(services),
+		}
+		return nil
 	}
 
+	// 监听器不存在，需要创建新的服务器
+	server := s.buildHTTPServer(listener)
 	netListener, err := s.createNetListener(listener)
 	if err != nil {
 		if hasPrevious {
@@ -354,6 +411,8 @@ func (s *Server) applyListenerConfig(listener models.PortListener, services []mo
 	}
 
 	s.servers[listener.ID] = server
+	s.routes[listener.ID] = routes
+	s.listeners[listener.ID] = listener
 	for id, proxy := range proxies {
 		s.proxies[id] = proxy
 	}
@@ -419,11 +478,306 @@ func (s *Server) createReverseProxyHandler(service models.ServiceConfig, proxies
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	// 配置 Director 设置请求头
+	proxy.Director = func(req *http.Request) {
+		// 保存原始请求信息用于设置转发头
+		originalHost := req.Host
+		originalRemoteAddr := req.RemoteAddr
+		originalTLS := req.TLS
+
+		req.URL.Scheme = targetURL.Scheme
+		req.URL.Host = targetURL.Host
+
+		// Host 头处理
+		if cfg.PreserveHost {
+			// 保留原始 Host 头
+			req.Host = originalHost
+		} else if cfg.HostHeader != "" {
+			// 使用自定义 Host 头
+			req.Host = cfg.HostHeader
+		} else {
+			req.Host = targetURL.Host
+		}
+
+		// 路径处理
+		if cfg.StripPathPrefix != "" && strings.HasPrefix(req.URL.Path, cfg.StripPathPrefix) {
+			req.URL.Path = strings.TrimPrefix(req.URL.Path, cfg.StripPathPrefix)
+			if req.URL.Path == "" {
+				req.URL.Path = "/"
+			}
+		}
+		if cfg.AddPathPrefix != "" {
+			req.URL.Path = cfg.AddPathPrefix + req.URL.Path
+		}
+
+		if _, ok := req.Header["User-Agent"]; !ok {
+			req.Header.Set("User-Agent", "")
+		}
+
+		// 隐藏发送给上游的请求头
+		for _, header := range cfg.HideHeaderUp {
+			req.Header.Del(header)
+		}
+
+		// 添加/修改发送给上游的请求头
+		for key, value := range cfg.HeaderUp {
+			if value == "" {
+				req.Header.Del(key)
+			} else {
+				// 支持变量替换
+				value = strings.ReplaceAll(value, "{host}", originalHost)
+				value = strings.ReplaceAll(value, "{remote}", originalRemoteAddr)
+				value = strings.ReplaceAll(value, "{scheme}", req.URL.Scheme)
+				req.Header.Set(key, value)
+			}
+		}
+
+		// 设置真实IP转发头（除非配置了信任上游代理头）
+		if !cfg.TrustProxyHeaders {
+			setForwardedHeaders(req, originalRemoteAddr, originalHost, originalTLS != nil)
+		}
+	}
+	// 使用全局共享的 Transport，启用连接复用
+	proxy.Transport = sharedTransport
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		// 隐藏发送给客户端的响应头
+		for _, header := range cfg.HideHeaderDown {
+			resp.Header.Del(header)
+		}
+		// 添加/修改发送给客户端的响应头
+		for key, value := range cfg.HeaderDown {
+			if value == "" {
+				resp.Header.Del(key)
+			} else {
+				resp.Header.Set(key, value)
+			}
+		}
+		return nil
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		fmt.Printf("反向代理错误: %v\n", err)
+		// 记录代理错误日志
+		clientIP := getClientIP(r.RemoteAddr)
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			clientIP = strings.TrimSpace(parts[0])
+		}
+		security.GetAuditLogger().LogProxyError(
+			cfg.Upstream,
+			clientIP,
+			fmt.Sprintf("%s %s: %s", r.Method, r.URL.Path, err.Error()),
+			nil,
+		)
+		http.Error(w, "代理服务不可用", http.StatusBadGateway)
+	}
+
 	proxies[service.ID] = proxy
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 检查是否是 WebSocket 升级请求
+		if isWebSocketUpgrade(r) {
+			handleWebSocketProxy(w, r, targetURL)
+			return
+		}
 		proxy.ServeHTTP(w, r)
 	}), nil
+}
+
+// isWebSocketUpgrade 检查请求是否是 WebSocket 升级请求
+func isWebSocketUpgrade(r *http.Request) bool {
+	return strings.ToLower(r.Header.Get("Upgrade")) == "websocket"
+}
+
+// getClientIP 从请求中获取客户端真实IP
+// 优先从 X-Forwarded-For 或 X-Real-IP 获取（如果有上游代理）
+// 否则从 RemoteAddr 获取
+func getClientIP(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
+}
+
+// setForwardedHeaders 设置代理转发头，向后端传递真实客户端信息
+func setForwardedHeaders(req *http.Request, remoteAddr, originalHost string, isHTTPS bool) {
+	clientIP := getClientIP(remoteAddr)
+
+	// X-Real-IP: 直接客户端IP
+	req.Header.Set("X-Real-IP", clientIP)
+
+	// X-Forwarded-For: 追加到已有的转发链
+	if prior := req.Header.Get("X-Forwarded-For"); prior != "" {
+		req.Header.Set("X-Forwarded-For", prior+", "+clientIP)
+	} else {
+		req.Header.Set("X-Forwarded-For", clientIP)
+	}
+
+	// X-Forwarded-Host: 原始请求的 Host
+	if req.Header.Get("X-Forwarded-Host") == "" {
+		req.Header.Set("X-Forwarded-Host", originalHost)
+	}
+
+	// X-Forwarded-Proto: 原始请求的协议
+	if req.Header.Get("X-Forwarded-Proto") == "" {
+		if isHTTPS {
+			req.Header.Set("X-Forwarded-Proto", "https")
+		} else {
+			req.Header.Set("X-Forwarded-Proto", "http")
+		}
+	}
+}
+
+// WebSocket upgrader 配置
+var wsUpgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // 允许所有来源
+	},
+}
+
+// handleWebSocketProxy 使用 gorilla/websocket 处理 WebSocket 代理
+func handleWebSocketProxy(w http.ResponseWriter, r *http.Request, targetURL *url.URL) {
+	// 构建后端 WebSocket URL
+	backendScheme := "ws"
+	if targetURL.Scheme == "https" {
+		backendScheme = "wss"
+	}
+	backendURL := url.URL{
+		Scheme:   backendScheme,
+		Host:     targetURL.Host,
+		Path:     r.URL.Path,
+		RawQuery: r.URL.RawQuery,
+	}
+
+	// 准备连接后端的请求头
+	requestHeader := http.Header{}
+	// 需要排除的头（hop-by-hop 头 + WebSocket 握手头）
+	excludeHeaders := map[string]bool{
+		"Connection":               true,
+		"Keep-Alive":               true,
+		"Proxy-Authenticate":       true,
+		"Proxy-Authorization":      true,
+		"Te":                       true,
+		"Trailer":                  true,
+		"Transfer-Encoding":        true,
+		"Upgrade":                  true,
+		"Sec-Websocket-Key":        true,
+		"Sec-Websocket-Version":    true,
+		"Sec-Websocket-Extensions": true,
+		"Sec-Websocket-Protocol":   true,
+	}
+	for key, values := range r.Header {
+		if excludeHeaders[key] {
+			continue
+		}
+		// 忽略大小写检查
+		keyLower := strings.ToLower(key)
+		if strings.HasPrefix(keyLower, "sec-websocket") {
+			continue
+		}
+		// 跳过 Origin 头，后面单独处理
+		if keyLower == "origin" {
+			continue
+		}
+		for _, v := range values {
+			requestHeader.Add(key, v)
+		}
+	}
+	// 设置 Host 头为后端地址（某些后端检查 Host）
+	requestHeader.Set("Host", targetURL.Host)
+	// Origin 处理策略：保留原始 Origin 或不设置
+	// 某些后端（如 VS Code Server）会检查 Origin 是否在允许列表中
+	// 如果完全移除 Origin，大多数后端会放行
+	// 这里选择不转发 Origin，让后端认为是直接连接
+	// 添加真实IP转发头
+	clientIP := getClientIP(r.RemoteAddr)
+	requestHeader.Set("X-Real-IP", clientIP)
+	if prior := r.Header.Get("X-Forwarded-For"); prior != "" {
+		requestHeader.Set("X-Forwarded-For", prior+", "+clientIP)
+	} else {
+		requestHeader.Set("X-Forwarded-For", clientIP)
+	}
+	requestHeader.Set("X-Forwarded-Host", r.Host)
+	if r.TLS != nil {
+		requestHeader.Set("X-Forwarded-Proto", "https")
+	} else {
+		requestHeader.Set("X-Forwarded-Proto", "http")
+	}
+
+	// 连接后端 WebSocket
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // 跳过后端 HTTPS 证书验证
+		},
+	}
+	// 如果原始请求有 subprotocol，传递给后端
+	if protocols := r.Header.Values("Sec-Websocket-Protocol"); len(protocols) > 0 {
+		dialer.Subprotocols = protocols
+	}
+
+	backendConn, resp, err := dialer.Dial(backendURL.String(), requestHeader)
+	if err != nil {
+		errMsg := fmt.Sprintf("WebSocket 后端连接失败: %s -> %s, 错误: %v", r.URL.String(), backendURL.String(), err)
+		if resp != nil {
+			errMsg += fmt.Sprintf(" (状态码: %d)", resp.StatusCode)
+		}
+		fmt.Println(errMsg)
+		http.Error(w, errMsg, http.StatusBadGateway)
+		return
+	}
+	defer backendConn.Close()
+
+	// 准备 upgrader 的响应头
+	responseHeader := http.Header{}
+	if subprotocol := backendConn.Subprotocol(); subprotocol != "" {
+		responseHeader.Set("Sec-WebSocket-Protocol", subprotocol)
+	}
+
+	// 升级客户端连接
+	clientConn, err := wsUpgrader.Upgrade(w, r, responseHeader)
+	if err != nil {
+		fmt.Printf("WebSocket 客户端升级失败: %v\n", err)
+		return
+	}
+	defer clientConn.Close()
+
+	// 双向转发 WebSocket 消息
+	errChan := make(chan error, 2)
+
+	// 客户端 -> 后端
+	go func() {
+		for {
+			messageType, message, err := clientConn.ReadMessage()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			if err := backendConn.WriteMessage(messageType, message); err != nil {
+				errChan <- err
+				return
+			}
+		}
+	}()
+
+	// 后端 -> 客户端
+	go func() {
+		for {
+			messageType, message, err := backendConn.ReadMessage()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			if err := clientConn.WriteMessage(messageType, message); err != nil {
+				errChan <- err
+				return
+			}
+		}
+	}()
+
+	// 等待任意一个方向出错
+	<-errChan
 }
 
 func normalizeReverseProxyUpstream(raw string) (*url.URL, error) {
@@ -818,191 +1172,26 @@ func (s *Server) handleOAuthRequest(listener models.PortListener, w http.Respons
 
 func (s *Server) renderOAuthLoginPage(w http.ResponseWriter, r *http.Request, errMsg string) {
 	redirectTarget := r.URL.Query().Get("redirect")
-	if redirectTarget == "" {
-		redirectTarget = "/"
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprintf(w, `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OAuth 登录</title>
-<style>
-:root{color-scheme:light}
-*{box-sizing:border-box}
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:
-radial-gradient(circle at top left,rgba(99,102,241,.26),transparent 32%%),
-radial-gradient(circle at top right,rgba(14,165,233,.22),transparent 28%%),
-linear-gradient(160deg,#0f172a,#1e293b 55%%,#111827);min-height:100vh;color:#0f172a}
-.shell{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
-.card{width:100%%;max-width:980px;display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr);background:rgba(255,255,255,.96);border:1px solid rgba(255,255,255,.22);backdrop-filter:blur(14px);border-radius:28px;overflow:hidden;box-shadow:0 30px 90px rgba(15,23,42,.34)}
-.hero{padding:42px 38px;background:linear-gradient(180deg,rgba(79,70,229,.96),rgba(37,99,235,.92));color:#fff;display:flex;flex-direction:column;justify-content:space-between;gap:28px}
-.hero-badge{display:inline-flex;align-items:center;gap:8px;width:max-content;padding:8px 12px;border-radius:999px;background:rgba(255,255,255,.16);font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
-.hero h1{margin:0;font-size:36px;line-height:1.12;font-weight:800}
-.hero p{margin:12px 0 0;font-size:15px;line-height:1.7;color:rgba(255,255,255,.88)}
-.hero-list{display:grid;gap:12px}
-.hero-item{display:flex;align-items:flex-start;gap:10px;font-size:14px;line-height:1.6;color:rgba(255,255,255,.9)}
-.hero-item strong{color:#fff}
-.form-wrap{padding:38px 34px;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#ffffff,#f8fafc)}
-.form-inner{width:100%%;max-width:400px}
-.eyebrow{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;background:#eef2ff;color:#4338ca;font-size:12px;font-weight:700}
-.form-title{margin:14px 0 6px;font-size:28px;font-weight:800;color:#0f172a}
-.form-desc{margin:0 0 22px;color:#64748b;font-size:14px;line-height:1.7}
-.error{background:#fef2f2;color:#b91c1c;padding:12px 14px;border-radius:14px;margin-bottom:16px;font-size:14px;border:1px solid #fecaca}
-.field{margin-bottom:16px}
-.field-header{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
-.field label{font-size:13px;color:#334155;font-weight:700}
-.field-hint{font-size:12px;color:#94a3b8}
-.input{width:100%%;padding:14px 15px;border:1px solid #dbe4f0;border-radius:14px;font-size:14px;transition:border-color .2s,box-shadow .2s;background:#fff}
-.input:focus{outline:none;border-color:#6366f1;box-shadow:0 0 0 4px rgba(99,102,241,.14)}
-.row{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:4px 0 20px;flex-wrap:wrap}
-.remember{display:inline-flex;align-items:center;gap:10px;color:#334155;font-size:14px;font-weight:600}
-.remember input{width:16px;height:16px;accent-color:#4f46e5}
-.remember-desc{font-size:12px;color:#64748b}
-.btn{width:100%%;border:none;border-radius:14px;padding:14px 18px;background:linear-gradient(135deg,#4f46e5,#2563eb);color:#fff;font-size:15px;font-weight:800;cursor:pointer;box-shadow:0 12px 26px rgba(79,70,229,.28);transition:transform .18s,box-shadow .18s,opacity .18s}
-.btn:hover{transform:translateY(-1px);box-shadow:0 16px 30px rgba(79,70,229,.34)}
-.btn:disabled{opacity:.72;cursor:not-allowed;transform:none}
-@media (max-width: 900px){
-.shell{padding:14px}
-.card{grid-template-columns:1fr;border-radius:22px}
-.hero{padding:26px 22px;gap:20px}
-.hero h1{font-size:28px}
-.form-wrap{padding:24px 18px 22px}
-.form-title{font-size:24px}
-}
-@media (max-width: 480px){
-.hero h1{font-size:24px}
-.hero p,.hero-item,.form-desc{font-size:13px}
-.input{padding:13px 14px;font-size:14px}
-.btn{padding:13px 16px}
-}
-</style>
-</head>
-<body>
-<div class="shell">
-  <div class="card">
-    <section class="hero">
-      <div>
-        <div class="hero-badge">OAuth Secure Access</div>
-        <h1>安全访问受保护服务</h1>
-        <p>当前服务已启用 OAuth 访问控制。请登录后继续访问，凭据会在浏览器端使用公钥加密后再提交到服务端。</p>
-      </div>
-      <div class="hero-list">
-        <div class="hero-item"><span>•</span><span><strong>服务地址登录：</strong>统一使用当前服务地址下的 <code>/OAuth</code> 入口。</span></div>
-        <div class="hero-item"><span>•</span><span><strong>移动端友好：</strong>页面针对小屏设备做了自适应布局与触控优化。</span></div>
-        <div class="hero-item"><span>•</span><span><strong>记住我：</strong>勾选后 JWT 有效期 30 天，否则默认 1 天。</span></div>
-      </div>
-    </section>
-    <section class="form-wrap">
-      <div class="form-inner">
-        <div class="eyebrow">服务认证</div>
-        <h2 class="form-title">登录继续访问</h2>
-        <p class="form-desc">输入用户名和密码后，系统会加密提交凭据并在验证成功后跳转回原始访问地址。</p>
-        %s
-        <form id="oauthLoginForm" method="post" action="/OAuth">
-          <input type="hidden" name="payload" id="oauthPayload">
-          <input type="hidden" name="redirect" value="%s">
-          <div class="field">
-            <div class="field-header">
-              <label for="oauthUsername">用户名</label>
-            </div>
-            <input class="input" type="text" id="oauthUsername" placeholder="请输入用户名" autocomplete="username" required>
-          </div>
-          <div class="field">
-            <div class="field-header">
-              <label for="oauthPassword">密码</label>
-            </div>
-            <input class="input" type="password" id="oauthPassword" placeholder="请输入密码" autocomplete="current-password" required>
-          </div>
-          <div class="row">
-            <label class="remember">
-              <input type="checkbox" id="oauthRemember">
-              <span>记住我</span>
-            </label>
-            <div class="remember-desc">勾选后保持 30 天，否则保持 1 天</div>
-          </div>
-          <button class="btn" type="submit" id="oauthSubmitBtn">登录并继续</button>
-        </form>
-      </div>
-    </section>
-  </div>
-</div>
-<script>
-const oauthPublicKeyPem = %s;
-const oauthForm = document.getElementById('oauthLoginForm');
-const oauthPayloadInput = document.getElementById('oauthPayload');
-const oauthSubmitBtn = document.getElementById('oauthSubmitBtn');
-
-function pemToArrayBuffer(pem) {
-  const cleaned = pem.replace(/-----BEGIN PUBLIC KEY-----|-----END PUBLIC KEY-----|\s+/g, '');
-  const binary = atob(cleaned);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes.buffer;
-}
-
-function arrayBufferToBase64Url(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let binary = '';
-  for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
-}
-
-oauthForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const username = document.getElementById('oauthUsername').value.trim();
-  const password = document.getElementById('oauthPassword').value;
-  const remember = document.getElementById('oauthRemember').checked;
-  if (!username || !password) {
-    oauthForm.submit();
-    return;
-  }
-  if (!window.crypto || !window.crypto.subtle) {
-    alert('当前环境不支持加密登录，请使用 HTTPS 或现代浏览器访问。');
-    return;
-  }
-  try {
-    oauthSubmitBtn.disabled = true;
-    oauthSubmitBtn.textContent = '正在加密并登录...';
-    const publicKey = await window.crypto.subtle.importKey(
-      'spki',
-      pemToArrayBuffer(oauthPublicKeyPem),
-      { name: 'RSA-OAEP', hash: 'SHA-256' },
-      false,
-      ['encrypt']
-    );
-    const payload = JSON.stringify({ username, password, remember });
-    const encrypted = await window.crypto.subtle.encrypt(
-      { name: 'RSA-OAEP' },
-      publicKey,
-      new TextEncoder().encode(payload)
-    );
-    oauthPayloadInput.value = arrayBufferToBase64Url(encrypted);
-    oauthForm.submit();
-  } catch (error) {
-    console.error(error);
-    alert('登录加密失败，请稍后重试。');
-    oauthSubmitBtn.disabled = false;
-    oauthSubmitBtn.textContent = '登录并继续';
-  }
-});
-</script>
-</body>
-</html>`, oauthErrorHTML(errMsg), htmlEscape(redirectTarget), strconv.Quote(s.oauthPublicKeyPEM))
+	oauth.RenderLoginPage(w, redirectTarget, errMsg, s.oauthPublicKeyPEM)
 }
 
 func (s *Server) handleOAuthLogin(w http.ResponseWriter, r *http.Request) {
+	remoteAddr := r.RemoteAddr
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		remoteAddr = strings.Split(xff, ",")[0]
+	}
+
 	if err := r.ParseForm(); err != nil {
-		fmt.Printf("OAuth 登录失败[表单解析失败] remote=%s err=%v\n", r.RemoteAddr, err)
+		fmt.Printf("OAuth 登录失败[表单解析失败] remote=%s err=%v\n", remoteAddr, err)
+		security.GetAuditLogger().LogOAuthLogin("", remoteAddr, false, "表单解析失败")
 		s.renderOAuthLoginPage(w, r, "表单解析失败")
 		return
 	}
 
 	payload, err := s.parseOAuthLoginPayload(r)
 	if err != nil {
-		fmt.Printf("OAuth 登录失败[解密失败] remote=%s err=%v\n", r.RemoteAddr, err)
+		fmt.Printf("OAuth 登录失败[解密失败] remote=%s err=%v\n", remoteAddr, err)
+		security.GetAuditLogger().LogOAuthLogin("", remoteAddr, false, err.Error())
 		s.renderOAuthLoginPage(w, r, err.Error())
 		return
 	}
@@ -1017,19 +1206,21 @@ func (s *Server) handleOAuthLogin(w http.ResponseWriter, r *http.Request) {
 
 	user := config.GetManager().GetUserByUsername(username)
 	if user == nil {
-		fmt.Printf("OAuth 登录失败[用户不存在] remote=%s username=%s redirect=%s\n", r.RemoteAddr, username, redirectTarget)
+		fmt.Printf("OAuth 登录失败[用户不存在] remote=%s username=%s redirect=%s\n", remoteAddr, username, redirectTarget)
+		security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, false, "用户不存在")
 		s.renderOAuthLoginPage(w, r, "用户名或密码错误")
 		return
 	}
 	if !user.Enabled {
-		fmt.Printf("OAuth 登录失败[用户被禁用] remote=%s username=%s redirect=%s\n", r.RemoteAddr, username, redirectTarget)
+		fmt.Printf("OAuth 登录失败[用户被禁用] remote=%s username=%s redirect=%s\n", remoteAddr, username, redirectTarget)
+		security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, false, "用户已被禁用")
 		s.renderOAuthLoginPage(w, r, "用户已被禁用")
 		return
 	}
 	if !security.ComparePassword(user.Password, password) {
 		fmt.Printf(
 			"OAuth 登录失败[密码错误] remote=%s username=%s redirect=%s password_len=%d encrypted_payload=%t stored_secure_hash=%t default_admin_match=%t\n",
-			r.RemoteAddr,
+			remoteAddr,
 			username,
 			redirectTarget,
 			len(password),
@@ -1037,6 +1228,7 @@ func (s *Server) handleOAuthLogin(w http.ResponseWriter, r *http.Request) {
 			security.IsSecurePasswordHash(user.Password),
 			username == "admin" && security.ComparePassword(user.Password, "admin"),
 		)
+		security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, false, "密码错误")
 		s.renderOAuthLoginPage(w, r, "用户名或密码错误")
 		return
 	}
@@ -1047,13 +1239,14 @@ func (s *Server) handleOAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	token, err := utils.GenerateToken(user.Username, user.Role, tokenTTL)
 	if err != nil {
-		fmt.Printf("OAuth 登录失败[令牌生成失败] remote=%s username=%s err=%v\n", r.RemoteAddr, username, err)
+		fmt.Printf("OAuth 登录失败[令牌生成失败] remote=%s username=%s err=%v\n", remoteAddr, username, err)
+		security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, false, "生成令牌失败")
 		s.renderOAuthLoginPage(w, r, "生成登录令牌失败")
 		return
 	}
 
+	security.GetAuditLogger().LogOAuthLogin(username, remoteAddr, true, "代理服务OAuth登录成功")
 	utils.SetAuthCookie(w, token, r.TLS != nil, tokenTTL)
-	fmt.Printf("OAuth 登录成功 remote=%s username=%s remember=%t redirect=%s\n", r.RemoteAddr, username, payload.Remember, redirectTarget)
 	http.Redirect(w, r, redirectTarget, http.StatusFound)
 }
 
@@ -1197,6 +1390,13 @@ func (s *Server) GetOAuthPublicKeyPEM() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.oauthPublicKeyPEM
+}
+
+// GetOAuthPrivateKey 返回 OAuth 私钥
+func (s *Server) GetOAuthPrivateKey() *rsa.PrivateKey {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.oauthPrivateKey
 }
 
 func (s *Server) DecryptSecurePayload(payload string) ([]byte, error) {

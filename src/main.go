@@ -93,6 +93,15 @@ func main() {
 		fmt.Println("已加载 secure 安全参数。")
 	}
 
+	// 初始化安全日志管理器
+	auditLogger := security.GetAuditLogger()
+	if err := auditLogger.InitStore(config.RuntimeSecurityLogCachePath()); err != nil {
+		fmt.Printf("初始化安全日志存储失败: %v\n", err)
+	}
+	auditLogger.SetMaxEntriesFunc(func() int {
+		return cfg.GetConfig().Global.MaxSecurityLogEntries
+	})
+
 	// 初始化Caddy服务器
 	caddyServer := caddy.GetServer()
 	caddyServer.SetSecureSecret(secureValue)
@@ -102,10 +111,14 @@ func main() {
 	// 设置HTTP路由
 	mux := http.NewServeMux()
 
-	// 静态文件服务（已内嵌到可执行文件）
+	// 管理后台OAuth登录页面（公开路径）
+	mux.HandleFunc("/admin-oauth", handlers.AdminOAuthHandler)
+
+	// 静态文件服务（已内嵌到可执行文件）需要认证
 	staticHandler := newStaticFileServer()
-	mux.Handle("/", staticHandler)
-	mux.Handle("/static/", http.StripPrefix("/static/", staticHandler))
+	protectedStaticHandler := handlers.AdminPageAuthMiddleware(staticHandler)
+	mux.Handle("/", protectedStaticHandler)
+	mux.Handle("/static/", http.StripPrefix("/static/", protectedStaticHandler))
 
 	// API路由
 	apiMux := http.NewServeMux()
@@ -356,6 +369,19 @@ func main() {
 			handlers.WriteError(w, http.StatusMethodNotAllowed, "Method not allowed")
 		}
 	})
+
+	// 安全日志
+	apiMux.HandleFunc("/api/security-logs", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			handlers.HandleGetSecurityLogs(w, r)
+		case http.MethodDelete:
+			handlers.HandleClearSecurityLogs(w, r)
+		default:
+			handlers.WriteError(w, http.StatusMethodNotAllowed, "Method not allowed")
+		}
+	})
+	apiMux.HandleFunc("/api/security-logs/stats", handlers.HandleGetSecurityLogStats)
 
 	// 服务器重启
 	apiMux.HandleFunc("/api/restart", handlers.RestartServerHandler)

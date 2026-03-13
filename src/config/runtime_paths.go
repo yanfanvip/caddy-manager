@@ -10,12 +10,13 @@ import (
 )
 
 const (
-	configFileName       = "caddy-panel.json"
-	pidFileName          = "caddy-panel.pid"
-	socketFileName       = "caddy-panel.sock"
-	monitorCacheRelative = "cache/monitor-cache.db"
-	managedCertsRelative = "certs/managed"
-	accountCertsRelative = "certs/accounts"
+	configFileName        = "caddy-panel.json"
+	pidFileName           = "caddy-panel.pid"
+	socketFileName        = "caddy-panel.sock"
+	monitorCacheRelative  = "cache/monitor-cache.db"
+	securityCacheRelative = "cache/security-logs.db"
+	managedCertsRelative  = "certs/managed"
+	accountCertsRelative  = "certs/accounts"
 )
 
 var (
@@ -94,6 +95,10 @@ func RuntimeSocketFilePath() string {
 
 func RuntimeMonitorCachePath() string {
 	return ResolveRuntimePath(monitorCacheRelative)
+}
+
+func RuntimeSecurityLogCachePath() string {
+	return ResolveRuntimePath(securityCacheRelative)
 }
 
 func RuntimeManagedCertDir() string {

@@ -264,6 +264,12 @@ func ListTerminalSessionsHandler(w http.ResponseWriter, r *http.Request) {
 func CreateTerminalSessionHandler(w http.ResponseWriter, r *http.Request) {
 	ensureTerminalJanitor()
 
+	remoteAddr := r.RemoteAddr
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		remoteAddr = strings.Split(xff, ",")[0]
+	}
+	username := getTerminalOwner(r)
+
 	var req struct {
 		ConnectionID string `json:"connection_id"`
 	}
@@ -278,27 +284,38 @@ func CreateTerminalSessionHandler(w http.ResponseWriter, r *http.Request) {
 
 	conn := config.GetManager().GetSSHConnection(req.ConnectionID)
 	if conn == nil {
+		security.GetAuditLogger().LogSSHConnect(username, remoteAddr, req.ConnectionID, false, "SSH连接配置不存在")
 		WriteError(w, http.StatusNotFound, "SSH connection not found")
 		return
 	}
 
-	session, err := createManagedTerminalSession(getTerminalOwner(r), *conn)
+	session, err := createManagedTerminalSession(username, *conn)
 	if err != nil {
+		security.GetAuditLogger().LogSSHConnect(username, remoteAddr, conn.Name, false, err.Error())
 		WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	security.GetAuditLogger().LogSSHConnect(username, remoteAddr, conn.Name, true, fmt.Sprintf("连接到 %s@%s:%d", conn.Username, conn.Host, conn.Port))
 	WriteSuccess(w, session.snapshot())
 }
 
 // DeleteTerminalSessionHandler 关闭终端会话
 func DeleteTerminalSessionHandler(w http.ResponseWriter, r *http.Request) {
+	remoteAddr := r.RemoteAddr
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		remoteAddr = strings.Split(xff, ",")[0]
+	}
+	username := getTerminalOwner(r)
+
 	id := terminalSessionIDFromPath(r.URL.Path)
-	session := getTerminalSessionForOwner(id, getTerminalOwner(r))
+	session := getTerminalSessionForOwner(id, username)
 	if session == nil {
 		WriteError(w, http.StatusNotFound, "Terminal session not found")
 		return
 	}
+	connName := session.Connection.Name
 	session.Close()
+	security.GetAuditLogger().LogSSHDisconnect(username, remoteAddr, connName, "主动关闭终端会话")
 	WriteSuccess(w, nil)
 }
 
