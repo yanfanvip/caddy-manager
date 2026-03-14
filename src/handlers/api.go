@@ -198,10 +198,10 @@ func CreateListenerHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 如果启用，启动监听器
+	// 如果启用，启动监听器（失败不影响数据保存）
 	if listener.Enabled {
 		if err := fnproxy.GetServer().StartListener(listener); err != nil {
-			WriteError(w, http.StatusInternalServerError, err.Error())
+			WriteSuccessWithMessage(w, listener, fmt.Sprintf("监听已保存，但启动失败: %v", err))
 			return
 		}
 	}
@@ -251,15 +251,15 @@ func UpdateListenerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 启用状态和配置热更新
+	// 启用状态和配置热更新（失败不影响数据保存）
 	if listener.Enabled {
 		if err := fnproxy.GetServer().StartListener(listener); err != nil {
-			WriteError(w, http.StatusInternalServerError, err.Error())
+			WriteSuccessWithMessage(w, listener, fmt.Sprintf("监听已保存，但启动失败: %v", err))
 			return
 		}
 	} else if oldListener.Enabled {
 		if err := fnproxy.GetServer().StopListener(id); err != nil {
-			WriteError(w, http.StatusInternalServerError, err.Error())
+			WriteSuccessWithMessage(w, listener, fmt.Sprintf("监听已保存，但停止失败: %v", err))
 			return
 		}
 	}
@@ -315,16 +315,23 @@ func ToggleListenerHandler(w http.ResponseWriter, r *http.Request) {
 
 	if running {
 		if err := fnproxy.GetServer().StopListener(id); err != nil {
-			WriteError(w, http.StatusInternalServerError, err.Error())
+			// 停止失败，尝试保存状态
+			updated.Enabled = false
+			if saveErr := config.GetManager().UpdateListener(updated); saveErr != nil {
+				WriteError(w, http.StatusInternalServerError, fmt.Sprintf("停止监听失败且保存状态失败: %v, %v", err, saveErr))
+				return
+			}
+			WriteSuccessWithMessage(w, updated, fmt.Sprintf("监听已停止，但停止过程出错: %v", err))
 			return
 		}
 		updated.Enabled = false
 		if err := config.GetManager().UpdateListener(updated); err != nil {
+			// 保存失败，尝试回滚
 			if restartErr := fnproxy.GetServer().StartListener(*listener); restartErr != nil {
-				WriteError(w, http.StatusInternalServerError, fmt.Sprintf("停止监听后保存状态失败，且回滚失败: %v", restartErr))
+				WriteSuccessWithMessage(w, updated, fmt.Sprintf("停止监听后保存状态失败，且回滚也失败: %v, %v", err, restartErr))
 				return
 			}
-			WriteError(w, http.StatusInternalServerError, err.Error())
+			WriteSuccessWithMessage(w, *listener, fmt.Sprintf("停止监听后保存状态失败，已回滚: %v", err))
 			return
 		}
 		// 记录安全日志
@@ -395,10 +402,10 @@ func CreateServiceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 重新加载对应端口的服务
+	// 重新加载对应端口的服务（失败不影响数据保存）
 	if service.Enabled {
 		if err := fnproxy.GetServer().ReloadService(service); err != nil {
-			WriteError(w, http.StatusInternalServerError, err.Error())
+			WriteSuccessWithMessage(w, service, fmt.Sprintf("规则已保存，但端口未运行: %v", err))
 			return
 		}
 	}
@@ -427,10 +434,10 @@ func UpdateServiceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 只有监听器是启用状态时才重新加载服务
+	// 只有监听器是启用状态时才重新加载服务（失败不影响数据保存）
 	if !wasListenerDisabled {
 		if err := fnproxy.GetServer().ReloadService(service); err != nil {
-			WriteError(w, http.StatusInternalServerError, err.Error())
+			WriteSuccessWithMessage(w, service, fmt.Sprintf("规则已保存，但端口未运行: %v", err))
 			return
 		}
 	}
@@ -452,9 +459,9 @@ func DeleteServiceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 重新加载对应端口的服务
+	// 重新加载对应端口的服务（失败不影响数据删除）
 	if err := fnproxy.GetServer().ReloadService(*service); err != nil {
-		WriteError(w, http.StatusInternalServerError, err.Error())
+		WriteSuccessWithMessage(w, nil, fmt.Sprintf("规则已删除，但端口未运行: %v", err))
 		return
 	}
 
@@ -475,14 +482,15 @@ func ReorderServicesHandler(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	services := config.GetManager().GetServicesByPort(req.PortID)
 	listener := config.GetManager().GetListener(req.PortID)
 	if listener != nil && listener.Enabled {
 		if err := fnproxy.GetServer().StartListener(*listener); err != nil {
-			WriteError(w, http.StatusInternalServerError, err.Error())
+			WriteSuccessWithMessage(w, services, fmt.Sprintf("排序已保存，但端口未运行: %v", err))
 			return
 		}
 	}
-	WriteSuccess(w, config.GetManager().GetServicesByPort(req.PortID))
+	WriteSuccess(w, services)
 }
 
 func ToggleServiceHandler(w http.ResponseWriter, r *http.Request) {
@@ -502,8 +510,9 @@ func ToggleServiceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 重新加载服务（失败不影响数据保存）
 	if err := fnproxy.GetServer().ReloadService(*service); err != nil {
-		WriteError(w, http.StatusInternalServerError, err.Error())
+		WriteSuccessWithMessage(w, service, fmt.Sprintf("状态已切换，但端口未运行: %v", err))
 		return
 	}
 	WriteSuccess(w, service)

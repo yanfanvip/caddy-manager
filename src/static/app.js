@@ -483,6 +483,70 @@ function hintIcon(text = '') {
     return `<span class="field-hint" tabindex="0" data-hint="${escapeHtml(text)}">i</span>`;
 }
 
+// tooltip DOM 全局单例
+let _tooltipEl = null;
+let _tooltipTarget = null;
+
+function getTooltipEl() {
+    if (!_tooltipEl) {
+        _tooltipEl = document.createElement('div');
+        _tooltipEl.className = 'field-hint-tooltip';
+        document.body.appendChild(_tooltipEl);
+    }
+    return _tooltipEl;
+}
+
+function showHintTooltip(target) {
+    const text = target.getAttribute('data-hint');
+    if (!text) return;
+    _tooltipTarget = target;
+    const el = getTooltipEl();
+    el.textContent = text;
+    el.classList.add('visible');
+    positionHintTooltip(target);
+}
+
+function positionHintTooltip(target) {
+    const el = getTooltipEl();
+    const rect = target.getBoundingClientRect();
+    const tooltipRect = el.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+    let top = rect.top - tooltipRect.height - 10;
+    // 边界处理
+    if (left < 8) left = 8;
+    if (left + tooltipRect.width > window.innerWidth - 8) left = window.innerWidth - tooltipRect.width - 8;
+    if (top < 8) top = rect.bottom + 10;
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
+}
+
+function hideHintTooltip() {
+    if (_tooltipEl) _tooltipEl.classList.remove('visible');
+    _tooltipTarget = null;
+}
+
+document.addEventListener('mouseover', e => {
+    const hint = e.target.closest('.field-hint');
+    if (hint) { showHintTooltip(hint); return; }
+    if (!_tooltipTarget || !_tooltipEl?.classList.contains('visible')) return;
+    if (!_tooltipTarget.contains(e.target)) hideHintTooltip();
+});
+document.addEventListener('mouseout', e => {
+    if (!_tooltipTarget) return;
+    if (e.relatedTarget && (_tooltipTarget.contains(e.relatedTarget) || _tooltipEl?.contains(e.relatedTarget))) return;
+    hideHintTooltip();
+});
+document.addEventListener('focusin', e => {
+    const hint = e.target.closest('.field-hint');
+    if (hint) showHintTooltip(hint);
+});
+document.addEventListener('focusout', e => {
+    if (_tooltipTarget && !_tooltipTarget.contains(e.relatedTarget)) hideHintTooltip();
+});
+document.addEventListener('scroll', () => {
+    if (_tooltipTarget && _tooltipEl?.classList.contains('visible')) positionHintTooltip(_tooltipTarget);
+}, true);
+
 function labelWithHint(label, hint = '') {
     return `<label class="field-label">${label}${hintIcon(hint)}</label>`;
 }
@@ -970,7 +1034,7 @@ async function loadListeners() {
             listenersData.data.forEach(async l => {
                 try {
                     const servicesData = await apiRequest(`/services?port_id=${l.id}`);
-                    const count = servicesData.success ? servicesData.data.length : 0;
+                    const count = servicesData?.data?.length || 0;
                     const countEl = document.getElementById(`service-count-${l.id}`);
                     if (countEl) countEl.textContent = count;
                 } catch (e) {
@@ -1760,12 +1824,9 @@ function formatDateTime(value) {
 
 function formatCertificateSource(source) {
     switch (source) {
-        case 'acme':
-            return 'ACME';
-        case 'file_sync':
-            return '配置文件';
-        default:
-            return '导入';
+        case 'acme': return 'ACME';
+        case 'file_sync': return '配置'
+        default: return '导入';
     }
 }
 
@@ -1777,14 +1838,10 @@ function formatCertificateChallenge(challenge) {
 
 function formatDNSProvider(provider) {
     switch (provider) {
-        case 'tencentcloud':
-            return '腾讯云';
-        case 'alidns':
-            return '阿里云';
-        case 'cloudflare':
-            return 'Cloudflare';
-        default:
-            return '-';
+        case 'tencentcloud': return '腾讯云';
+        case 'alidns': return '阿里云';
+        case 'cloudflare': return 'Cloudflare';
+        default: return '-';
     }
 }
 
@@ -1868,9 +1925,9 @@ async function loadCertificates() {
             <tr>
                 <td class="service-name-cell">${escapeHtml(cert.name || cert.domains?.[0] || '未命名证书')}</td>
                 <td>${renderCertificateDomains(cert.domains || [])}</td>
-                <td>${formatCertificateSource(cert.source)}</td>
-                <td>${formatCertificateChallenge(cert.challenge_type)}</td>
-                <td>${formatDNSProvider(cert.dns_provider)}</td>
+                <td class="cert-col-short">${formatCertificateSource(cert.source)}</td>
+                <td class="cert-col-short">${formatCertificateChallenge(cert.challenge_type)}</td>
+                <td class="cert-col-short">${formatDNSProvider(cert.dns_provider)}</td>
                 <td>${formatDateTime(cert.expires_at)}</td>
                 <td>${formatDateTime(cert.next_renew_at)}</td>
                 <td>
@@ -3726,7 +3783,6 @@ function showAdvancedDocsSidebar(type) {
         title.textContent = `${typeNames[type] || type} 高级配置说明`;
         content.innerHTML = docsHtml;
         sidebar.classList.add('active');
-        document.body.style.overflow = 'hidden';
     }
 }
 
@@ -3735,7 +3791,6 @@ function closeAdvancedDocsSidebar() {
     const sidebar = document.getElementById('advancedDocsSidebar');
     if (sidebar) {
         sidebar.classList.remove('active');
-        document.body.style.overflow = '';
     }
 }
 
