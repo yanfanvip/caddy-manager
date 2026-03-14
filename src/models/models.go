@@ -347,8 +347,11 @@ type SecurityLogEntry struct {
 type FirewallRuleType string
 
 const (
-	FirewallRuleTypeIP       FirewallRuleType = "ip"       // IP/IP段
-	FirewallRuleTypeCountry FirewallRuleType = "country"   // 国家
+	FirewallRuleTypeIP           FirewallRuleType = "ip"            // IP/IP段
+	FirewallRuleTypeCountry      FirewallRuleType = "country"       // 自定义国家列表
+	FirewallRuleTypeAll          FirewallRuleType = "all"           // 全部IP
+	FirewallRuleTypeChina        FirewallRuleType = "china"         // 中国大陆境内
+	FirewallRuleTypeOutsideChina FirewallRuleType = "outside_china" // 中国大陆境外
 )
 
 // FirewallAction 防火墙规则动作

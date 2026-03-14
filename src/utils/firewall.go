@@ -118,18 +118,59 @@ func firewallMatchRules(clientIP, country string, cfg *models.FirewallConfig) mo
 		if !rule.Enabled {
 			continue
 		}
-		if rule.Type == models.FirewallRuleTypeIP {
+		switch rule.Type {
+		case models.FirewallRuleTypeIP:
 			if firewallMatchIPRule(clientIP, rule.IPs) {
 				return rule.Action
 			}
-		}
-		if rule.Type == models.FirewallRuleTypeCountry {
+		case models.FirewallRuleTypeCountry:
 			if firewallMatchCountryRule(country, rule.Countries) {
+				return rule.Action
+			}
+		case models.FirewallRuleTypeAll:
+			// 匹配所有 IP
+			return rule.Action
+		case models.FirewallRuleTypeChina:
+			// 中国大陆境内：country 为 CN，或私有/内网 IP（无法定位到国家）
+			if country == "CN" || (country == "" && firewallIsPrivateIP(clientIP)) {
+				return rule.Action
+			}
+		case models.FirewallRuleTypeOutsideChina:
+			// 中国大陆境外：非 CN 的公网 IP；私有/内网 IP 不属于"境外"，不匹配
+			if country != "CN" && !firewallIsPrivateIP(clientIP) {
 				return rule.Action
 			}
 		}
 	}
 	return ""
+}
+
+// firewallIsPrivateIP 检查是否为私有/内网地址（RFC1918 + 链路本地）
+func firewallIsPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return false
+	}
+	// 10.0.0.0/8
+	if v4[0] == 10 {
+		return true
+	}
+	// 172.16.0.0/12
+	if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
+		return true
+	}
+	// 192.168.0.0/16
+	if v4[0] == 192 && v4[1] == 168 {
+		return true
+	}
+	return false
 }
 
 func firewallMatchIPRule(clientIP string, ips []string) bool {
