@@ -293,32 +293,42 @@ func (s *Server) buildListenerRoutes(listener models.PortListener, services []mo
 func (s *Server) buildHTTPServer(listener models.PortListener) *http.Server {
 	addr := fmt.Sprintf(":%d", listener.Port)
 	listenerID := listener.ID
+
+	// 核心业务处理器（经过防火墙检查后执行）
+	coreHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 动态获取监听器配置（用于 OAuth）
+		s.mu.RLock()
+		currentListener, hasListener := s.listeners[listenerID]
+		routes := s.routes[listenerID]
+		s.mu.RUnlock()
+
+		if !hasListener {
+			http.NotFound(w, r)
+			return
+		}
+
+		if s.handleOAuthRequest(currentListener, w, r) {
+			return
+		}
+		host := normalizeHost(r.Host)
+		if route := matchServiceRoute(routes, host); route != nil {
+			route.handler.ServeHTTP(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	// 防火墙包裹核心处理器（优先级最高）
+	firewallHandler := utils.FirewallMiddleware(coreHandler)
+
 	return &http.Server{
 		Addr: addr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// ACME HTTP-01 证书验证请求必须绕过防火墙（公网可访问性要求）
 			if utils.GetCertificateManager().ServeHTTPChallenge(w, r) {
 				return
 			}
-			// 动态获取监听器配置（用于 OAuth）
-			s.mu.RLock()
-			currentListener, hasListener := s.listeners[listenerID]
-			routes := s.routes[listenerID]
-			s.mu.RUnlock()
-
-			if !hasListener {
-				http.NotFound(w, r)
-				return
-			}
-
-			if s.handleOAuthRequest(currentListener, w, r) {
-				return
-			}
-			host := normalizeHost(r.Host)
-			if route := matchServiceRoute(routes, host); route != nil {
-				route.handler.ServeHTTP(w, r)
-				return
-			}
-			http.NotFound(w, r)
+			firewallHandler.ServeHTTP(w, r)
 		}),
 	}
 }

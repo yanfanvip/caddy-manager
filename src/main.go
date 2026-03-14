@@ -415,12 +415,14 @@ func main() {
 	// 服务器重启
 	apiMux.HandleFunc("/api/restart", handlers.RestartServerHandler)
 
+	// GeoIP 查询（无需认证，公开接口）
+	apiMux.HandleFunc("/api/geoip", handlers.HandleGeoIPLookup)
+
 	// WebSocket终端
 	apiMux.HandleFunc("/ws/terminal", handlers.TerminalHandler)
 
 	// 应用中间件
 	var handler http.Handler = apiMux
-	handler = middleware.FirewallMiddleware(handler)
 	handler = middleware.AuthMiddleware(handler)
 	handler = middleware.CORSMiddleware(handler)
 	handler = middleware.LoggingMiddleware(handler)
@@ -429,9 +431,9 @@ func main() {
 	mux.Handle("/api/", handler)
 	mux.Handle("/ws/", handler)
 
-	// 创建HTTP服务器
+	// 创建HTTP服务器（防火墙优先级最高，覆盖所有路由）
 	adminPort := config.GetRuntimeAdminPort(cfg.GetConfig().Global.AdminPort)
-	server := &http.Server{Handler: mux}
+	server := &http.Server{Handler: middleware.FirewallMiddleware(mux)}
 	var (
 		adminListener net.Listener
 		listenErr     error

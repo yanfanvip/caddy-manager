@@ -61,6 +61,7 @@ func isPublicPath(path string) bool {
 		"/api/login",
 		"/api/auth/public-key",
 		"/api/logout",
+		"/api/geoip",
 	}
 	for _, p := range publicPaths {
 		if path == p {
